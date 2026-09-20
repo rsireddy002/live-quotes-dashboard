@@ -3,8 +3,8 @@ Live Quotes Dashboard — NSE stocks (F&O + Equity)
 ------------------------------------------------------
 Streamlit app showing a live, auto-refreshing table of:
     Sl No | Symbol | Prev Close | LTP | % Change | Volume
-and, for the F&O universe (~190 stocks):
-    VWAP | 200 EMA (5-min) | Just Crossed VWAP | Just Crossed EMA
+and, for the F&O universe (~190 stocks) plus Nifty 50 / Bank Nifty:
+    RVOL | VWAP | 200 EMA (5-min) | Just Crossed VWAP | Just Crossed EMA
 using the Upstox API. LTP/quote data refreshes on the fast interval you set
 in the sidebar; VWAP/EMA/crossovers recompute every 5 minutes (matching
 5-min candle close), independent of that faster refresh loop.
@@ -44,6 +44,7 @@ V3_HIST_URL = "https://api.upstox.com/v3/historical-candle/{key}/minutes/5/{to_d
 V3_INTRADAY_URL = "https://api.upstox.com/v3/historical-candle/intraday/{key}/minutes/5"
 EMA_PERIOD = 200
 HIST_LOOKBACK_DAYS = 45  # calendar days of 5-min history — enough bars for EMA-200 to properly converge
+RVOL_LOOKBACK_DAYS = 10  # prior trading sessions used for the RVOL comparison
 HIST_CHUNK_DAYS = 25  # matches the 25-day chunking already used for historical candles elsewhere
 INDICATOR_TTL = 300  # seconds — recompute VWAP/EMA/crossovers every 5 min, not every LTP refresh
 
@@ -229,14 +230,14 @@ def _cross_flag(prev_close, now_close, prev_ind, now_ind):
 
 def _compute_indicator_row(df):
     if df is None or df.empty:
-        return {"VWAP": None, "200 EMA (5m)": None, "Just Crossed VWAP": "", "Just Crossed EMA": ""}
+        return {"RVOL": None, "VWAP": None, "200 EMA (5m)": None, "Just Crossed VWAP": "", "Just Crossed EMA": ""}
 
     # Drop a still-forming candle (its 5-min bar hasn't closed yet) so VWAP/EMA
     # and crossover checks only ever use fully closed 5-min bars.
     now = pd.Timestamp.now(tz=IST)
     df = df[df["ts"] + pd.Timedelta(minutes=5) <= now]
     if df.empty:
-        return {"VWAP": None, "200 EMA (5m)": None, "Just Crossed VWAP": "", "Just Crossed EMA": ""}
+        return {"RVOL": None, "VWAP": None, "200 EMA (5m)": None, "Just Crossed VWAP": "", "Just Crossed EMA": ""}
 
     # Use the most recent trading session present in the data (not literal
     # calendar "today") so VWAP still shows correctly on weekends/holidays/
@@ -251,6 +252,21 @@ def _compute_indicator_row(df):
     else:
         vwap_series = pd.Series(dtype=float)
 
+    # RVOL: today's cumulative volume so far vs. the average cumulative volume
+    # through the same number of 5-min bars on the last N prior sessions
+    # (time-of-day aligned, not just a flat full-day average).
+    bar_count = len(session_df)
+    today_cum_vol = session_df["volume"].sum() if bar_count else None
+    past_days = sorted(d for d in df["ts"].dt.date.unique() if d != session_date)
+    past_days = past_days[-RVOL_LOOKBACK_DAYS:]
+    past_sums = []
+    for d in past_days:
+        day_df = df[df["ts"].dt.date == d].iloc[:bar_count]
+        if len(day_df) >= bar_count and bar_count > 0:
+            past_sums.append(day_df["volume"].sum())
+    avg_past_vol = (sum(past_sums) / len(past_sums)) if past_sums else None
+    rvol = (today_cum_vol / avg_past_vol) if (today_cum_vol is not None and avg_past_vol) else None
+
     ema_series = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
 
     close_now = df["close"].iloc[-1]
@@ -261,6 +277,7 @@ def _compute_indicator_row(df):
     ema_prev = ema_series.iloc[-2] if len(ema_series) > 1 else None
 
     return {
+        "RVOL": round(rvol, 2) if rvol is not None else None,
         "VWAP": round(vwap_now, 2) if vwap_now is not None and not pd.isna(vwap_now) else None,
         "200 EMA (5m)": round(ema_now, 2) if ema_now is not None else None,
         "Just Crossed VWAP": _cross_flag(close_prev, close_now, vwap_prev, vwap_now),
@@ -342,11 +359,21 @@ with placeholder.container():
                 return ""
             return "color: green; font-weight: 600" if val.startswith("↑") else "color: red; font-weight: 600"
 
+        def color_rvol(val):
+            if val is None or pd.isna(val):
+                return ""
+            if val >= 2:
+                return "color: green; font-weight: 600"
+            if val >= 1.5:
+                return "color: darkorange; font-weight: 600"
+            return ""
+
         style_fn = df.style.map if hasattr(df.style, "map") else df.style.applymap
         fmt = {"LTP": "{:.2f}", "% Change": "{:.2f}%", "Prev Close": "{:.2f}"}
         styled = style_fn(color_pct, subset=["% Change"])
         if show_indicators:
-            fmt.update({"VWAP": "{:.2f}", "200 EMA (5m)": "{:.2f}"})
+            fmt.update({"RVOL": "{:.2f}x", "VWAP": "{:.2f}", "200 EMA (5m)": "{:.2f}"})
+            styled = styled.map(color_rvol, subset=["RVOL"]) if hasattr(styled, "map") else styled.applymap(color_rvol, subset=["RVOL"])
             styled = styled.map(color_cross, subset=["Just Crossed VWAP", "Just Crossed EMA"]) if hasattr(
                 styled, "map"
             ) else styled.applymap(color_cross, subset=["Just Crossed VWAP", "Just Crossed EMA"])
@@ -354,7 +381,7 @@ with placeholder.container():
         st.dataframe(styled, use_container_width=True, height=700, hide_index=True)
 
         if not show_indicators:
-            st.caption("Switch Universe to \"F&O stocks only\" in the sidebar to see VWAP / 200 EMA (5-min) / crossover columns.")
+            st.caption("Switch Universe to \"F&O stocks only\" in the sidebar to see RVOL / VWAP / 200 EMA (5-min) / crossover columns.")
 
 now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 status.caption(f"Last updated: {now}")
