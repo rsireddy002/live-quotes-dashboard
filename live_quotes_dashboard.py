@@ -467,10 +467,17 @@ else:
     fig.add_trace(go.Scatter(x=plot_df["ts"], y=plot_df["ema"], name="200 EMA (5m)", line=dict(color="blue", width=1.5)))
     fig.add_trace(go.Scatter(x=sess["ts"], y=vwap_line, name="VWAP (session)", line=dict(color="orange", width=1.5)))
 
+    last_close = plot_df["close"].iloc[-1]
     for lo, hi, touches in sr_zones:
+        if hi < last_close:
+            color, label = "green", "Support"
+        elif lo > last_close:
+            color, label = "red", "Resistance"
+        else:
+            color, label = "gray", "At price"
         fig.add_hrect(
-            y0=lo, y1=hi, fillcolor="purple", opacity=0.15, line_width=0,
-            annotation_text=f"{touches}×", annotation_position="right",
+            y0=lo, y1=hi, fillcolor=color, opacity=0.15, line_width=0,
+            annotation_text=f"{label} {touches}×", annotation_position="right",
         )
 
     fig.update_layout(
