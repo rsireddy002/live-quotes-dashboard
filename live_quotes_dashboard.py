@@ -9,11 +9,15 @@ using the Upstox API. LTP/quote data refreshes on the fast interval you set
 in the sidebar; VWAP/EMA/crossovers recompute every 5 minutes (matching
 5-min candle close), independent of that faster refresh loop.
 
+Below the table, a Chart section lets you pick any symbol and see a 5-min
+candlestick chart with VWAP, 200 EMA, and 18-day composite support/resistance
+zones (wide bands from clustered daily highs/lows, not thin lines) overlaid.
+
 Run with:
     python -m streamlit run live_quotes_dashboard.py
 
 Setup:
-    1. pip install streamlit requests pandas --break-system-packages   (Windows: drop --break-system-packages)
+    1. pip install streamlit requests pandas plotly --break-system-packages   (Windows: drop --break-system-packages)
     2. Set your Upstox access token as an environment variable before launching:
          Windows PowerShell:  $env:UPSTOX_ACCESS_TOKEN = "your_token_here"
        Or just paste it into the sidebar box when the app opens.
@@ -31,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -47,6 +52,13 @@ HIST_LOOKBACK_DAYS = 45  # calendar days of 5-min history — enough bars for EM
 RVOL_LOOKBACK_DAYS = 10  # prior trading sessions used for the RVOL comparison
 HIST_CHUNK_DAYS = 25  # matches the 25-day chunking already used for historical candles elsewhere
 INDICATOR_TTL = 300  # seconds — recompute VWAP/EMA/crossovers every 5 min, not every LTP refresh
+
+# 18-day composite support/resistance zones — matches the existing methodology:
+# wide zones (clustered daily highs/lows), not thin single-price lines.
+SR_LOOKBACK_DAYS = 18
+SR_ZONE_PCT = 0.005  # cluster daily highs/lows within 0.5% of each other into one zone
+SR_MIN_TOUCHES = 2  # a zone needs at least this many daily highs/lows to count
+CHART_DISPLAY_DAYS = 10  # how many recent trading days to actually plot (EMA still uses full history)
 
 st.set_page_config(page_title="Live NSE Quotes", layout="wide")
 st.title("📈 Live NSE Quotes — F&O + Equity")
@@ -307,6 +319,40 @@ def compute_indicators(keys_tuple, _headers, five_min_bucket):
     return results
 
 
+def compute_sr_zones(df, lookback_days=SR_LOOKBACK_DAYS, zone_pct=SR_ZONE_PCT, min_touches=SR_MIN_TOUCHES):
+    """18-day composite support/resistance: cluster each of the last N trading
+    days' session high + session low into wide zones (not thin lines) — a
+    zone only counts if at least min_touches daily highs/lows land in it."""
+    if df is None or df.empty:
+        return []
+    trading_days = sorted(df["ts"].dt.date.unique())[-lookback_days:]
+    levels = []
+    for d in trading_days:
+        day_rows = df[df["ts"].dt.date == d]
+        if day_rows.empty:
+            continue
+        levels.append(float(day_rows["high"].max()))
+        levels.append(float(day_rows["low"].min()))
+    if not levels:
+        return []
+    levels.sort()
+    clusters, current = [], [levels[0]]
+    for lvl in levels[1:]:
+        if lvl <= current[0] * (1 + zone_pct):
+            current.append(lvl)
+        else:
+            clusters.append(current)
+            current = [lvl]
+    clusters.append(current)
+    return [(min(c), max(c), len(c)) for c in clusters if len(c) >= min_touches]
+
+
+@st.cache_data(ttl=INDICATOR_TTL, show_spinner="Loading chart data...")
+def get_chart_candles(key, _headers, five_min_bucket):
+    _, df = _fetch_candles_for_key(key, _headers)
+    return df
+
+
 placeholder = st.empty()
 status = st.empty()
 
@@ -382,6 +428,68 @@ with placeholder.container():
 
         if not show_indicators:
             st.caption("Switch Universe to \"F&O stocks only\" in the sidebar to see RVOL / VWAP / 200 EMA (5-min) / crossover columns.")
+
+st.divider()
+st.subheader("📊 Chart")
+
+symbol_to_key = {v: k for k, v in key_to_symbol.items()}
+chart_options = sorted(symbol_to_key.keys())
+default_idx = chart_options.index("NIFTY 50") if "NIFTY 50" in chart_options else 0
+chart_col1, chart_col2 = st.columns([2, 1])
+with chart_col1:
+    selected_symbol = st.selectbox("Symbol", chart_options, index=default_idx)
+with chart_col2:
+    display_days = st.slider("Days to display", min_value=3, max_value=30, value=CHART_DISPLAY_DAYS)
+
+chart_key = symbol_to_key[selected_symbol]
+chart_df = get_chart_candles(chart_key, HEADERS, _current_five_min_bucket())
+
+if chart_df is None or chart_df.empty:
+    st.info("No candle data available for this symbol yet.")
+else:
+    chart_df = chart_df.assign(ema=chart_df["close"].ewm(span=EMA_PERIOD, adjust=False).mean())
+    sr_zones = compute_sr_zones(chart_df)
+
+    all_days = sorted(chart_df["ts"].dt.date.unique())
+    shown_days = all_days[-display_days:]
+    plot_df = chart_df[chart_df["ts"].dt.date.isin(shown_days)]
+
+    session_date = plot_df["ts"].dt.date.max()
+    sess = plot_df[plot_df["ts"].dt.date == session_date]
+    typ = (sess["high"] + sess["low"] + sess["close"]) / 3
+    vwap_line = (typ * sess["volume"]).cumsum() / sess["volume"].cumsum().replace(0, pd.NA)
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=plot_df["ts"], open=plot_df["open"], high=plot_df["high"],
+        low=plot_df["low"], close=plot_df["close"], name="Price",
+    ))
+    fig.add_trace(go.Scatter(x=plot_df["ts"], y=plot_df["ema"], name="200 EMA (5m)", line=dict(color="blue", width=1.5)))
+    fig.add_trace(go.Scatter(x=sess["ts"], y=vwap_line, name="VWAP (session)", line=dict(color="orange", width=1.5)))
+
+    for lo, hi, touches in sr_zones:
+        fig.add_hrect(
+            y0=lo, y1=hi, fillcolor="purple", opacity=0.15, line_width=0,
+            annotation_text=f"{touches}×", annotation_position="right",
+        )
+
+    fig.update_layout(
+        title=f"{selected_symbol} — 5-min ({len(shown_days)} sessions shown) · {len(sr_zones)} {SR_LOOKBACK_DAYS}-day S/R zone(s)",
+        xaxis_rangeslider_visible=False,
+        height=650,
+        margin=dict(t=50, b=20),
+    )
+    fig.update_xaxes(
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),  # hide weekends
+            dict(bounds=[15.5, 9.25], pattern="hour"),  # hide overnight gap (15:30 -> next 9:15 IST)
+        ]
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"S/R zones: last {SR_LOOKBACK_DAYS} sessions' daily highs/lows clustered within "
+        f"{SR_ZONE_PCT * 100:.1f}% of each other, kept only with ≥{SR_MIN_TOUCHES} touches."
+    )
 
 now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 status.caption(f"Last updated: {now}")
