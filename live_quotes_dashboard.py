@@ -51,13 +51,23 @@ st.set_page_config(page_title="Live NSE Quotes", layout="wide")
 st.title("📈 Live NSE Quotes — F&O + Equity")
 
 # ---------------- Sidebar controls ----------------
+def _default_token():
+    env_val = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
+    if env_val:
+        return env_val
+    try:
+        return st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+    except Exception:
+        return ""  # no secrets.toml locally — that's fine
+
+
 with st.sidebar:
     st.header("Settings")
     token = st.text_input(
         "Upstox Access Token",
-        value=os.environ.get("UPSTOX_ACCESS_TOKEN", ""),
+        value=_default_token(),
         type="password",
-        help="Reads UPSTOX_ACCESS_TOKEN env var by default; can paste one here instead.",
+        help="Reads UPSTOX_ACCESS_TOKEN from env var or Streamlit secrets by default; can paste one here instead.",
     )
     refresh_secs = st.number_input("Refresh interval (seconds)", min_value=3, max_value=60, value=5)
     universe = st.radio(
